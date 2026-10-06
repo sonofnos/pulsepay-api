@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pulsepay
+          POSTGRES_PASSWORD: pulsepay
+          POSTGRES_DB: pulsepay_api
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U pulsepay"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: pdo_pgsql, redis
+          coverage: none
+
+      - name: Install dependencies
+        run: composer install --no-progress --prefer-dist
+
+      - name: Copy environment file
+        run: cp .env.example .env
+
+      - name: Generate app key
+        run: php artisan key:generate
+
+      - name: Lint (Pint, dry run)
+        run: vendor/bin/pint --test
+
+      - name: Run migrations against real Postgres
+        env:
+          DB_CONNECTION: pgsql
+          DB_HOST: 127.0.0.1
+          DB_PORT: 5432
+          DB_DATABASE: pulsepay_api
+          DB_USERNAME: pulsepay
+          DB_PASSWORD: pulsepay
+        run: php artisan migrate --force
+
+      # phpunit.xml pins DB_CONNECTION to an in-memory sqlite db for speed/isolation;
+      # Redis is NOT overridden there (the EnsureIdempotent middleware talks to the
+      # Redis facade directly, not the cache store), so these tests hit the real
+      # Redis service container above, so idempotency behavior is tested for real.
+      - name: Run tests
+        env:
+          REDIS_HOST: 127.0.0.1
+          REDIS_PORT: 6379
+          REDIS_CLIENT: predis
+        run: php artisan test
+
+      - name: Ledger concurrency demo against real Postgres
+        env:
+          DB_CONNECTION: pgsql
+          DB_HOST: 127.0.0.1
+          DB_PORT: 5432
+          DB_DATABASE: pulsepay_api
+          DB_USERNAME: pulsepay
+          DB_PASSWORD: pulsepay
+          REDIS_HOST: 127.0.0.1
+          REDIS_PORT: 6379
+          REDIS_CLIENT: predis
+          CACHE_STORE: redis
+        run: |
+          php artisan serve --port=8123 &
+          sleep 2
+          BASE_URL=http://127.0.0.1:8123 bash scripts/concurrency_demo.sh 15
